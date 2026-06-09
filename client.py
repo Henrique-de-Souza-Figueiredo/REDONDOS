@@ -16,8 +16,26 @@ NAME = sys.argv[2] if len(sys.argv) > 2 else "Player"
 ROOM_CODE = sys.argv[3] if len(sys.argv) > 3 else ""
 PORT = 50007
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "client_config.json")
-LOCAL_SERVER_PID_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local_server.pid")
+def app_dir():
+    return os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+
+
+def resolve_server_launcher():
+    base = app_dir()
+    candidates = [
+        ([os.path.join(base, "REDONDOS_Server.exe")], base),
+        ([os.path.join(base, "server.exe")], base),
+        ([sys.executable, os.path.join(base, "server.py")], base),
+    ]
+    for cmd, cwd in candidates:
+        target = cmd[0] if len(cmd) == 1 else cmd[1]
+        if os.path.exists(target):
+            return cmd, cwd
+    return [sys.executable, os.path.join(base, "server.py")], base
+
+
+CONFIG_PATH = os.path.join(app_dir(), "client_config.json")
+LOCAL_SERVER_PID_PATH = os.path.join(app_dir(), "local_server.pid")
 
 pygame.mixer.pre_init(44100, -16, 2, 512)
 pygame.init()
@@ -37,6 +55,7 @@ connected = False
 sock = None
 local_server = None
 local_server_config = None
+local_server_owned = False
 
 CARD_RECTS = []
 CARD_ACTION_RECTS = []
@@ -600,10 +619,11 @@ def sanitize_room_code(value):
 
 
 def start_local_server(room_code, infinite_mode=False, mutators_enabled=False, more_cards_enabled=False):
-    global local_server, local_server_config
+    global local_server, local_server_config, local_server_owned
     room_code = sanitize_room_code(room_code) or generate_room_code()
     requested = {
         "room_code": room_code,
+        "allow_solo": True,
         "infinite": bool(infinite_mode),
         "mutators": bool(mutators_enabled),
         "more_cards": bool(more_cards_enabled),
@@ -615,8 +635,8 @@ def start_local_server(room_code, infinite_mode=False, mutators_enabled=False, m
     else:
         stop_orphan_local_servers()
 
-    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.py")
-    cmd = [sys.executable, script, "--room-code", room_code, "--allow-solo"]
+    cmd, launch_cwd = resolve_server_launcher()
+    cmd = list(cmd) + ["--room-code", room_code, "--allow-solo"]
     if infinite_mode:
         cmd.append("--infinite")
     if mutators_enabled:
@@ -632,7 +652,7 @@ def start_local_server(room_code, infinite_mode=False, mutators_enabled=False, m
     try:
         local_server = subprocess.Popen(
             cmd,
-            cwd=os.path.dirname(script),
+            cwd=launch_cwd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             startupinfo=startupinfo,
@@ -642,20 +662,23 @@ def start_local_server(room_code, infinite_mode=False, mutators_enabled=False, m
         if local_server.poll() is not None:
             local_server = None
             local_server_config = None
+            local_server_owned = False
             clear_local_server_pid()
             return "Nao foi possivel iniciar o servidor. A porta 50007 pode estar em uso."
         local_server_config = requested
+        local_server_owned = True
         write_local_server_pid(local_server.pid)
         return ""
     except Exception as e:
         local_server = None
         local_server_config = None
+        local_server_owned = False
         clear_local_server_pid()
         return f"Nao foi possivel iniciar o servidor ({e})"
 
 
 def stop_local_server():
-    global local_server, local_server_config
+    global local_server, local_server_config, local_server_owned
     if local_server and local_server.poll() is None:
         local_server.terminate()
         try:
@@ -664,6 +687,7 @@ def stop_local_server():
             local_server.kill()
     local_server = None
     local_server_config = None
+    local_server_owned = False
     clear_local_server_pid()
 
 
@@ -676,7 +700,7 @@ def stop_orphan_local_servers():
     if os.name == "nt":
         cmd = (
             "Get-CimInstance Win32_Process | "
-            "Where-Object { $_.Name -match 'python' -and $_.CommandLine -match 'server.py' -and $_.CommandLine -match '--allow-solo' } | "
+            "Where-Object { (($_.Name -match 'python' -and $_.CommandLine -match 'server.py') -or $_.Name -match 'REDONDOS_Server.exe|server.exe') } | "
             "ForEach-Object { $_.ProcessId }"
         )
         try:
@@ -725,7 +749,7 @@ def close_connection(stop_host=False):
     except Exception:
         pass
     sock = None
-    if stop_host:
+    if stop_host and local_server_owned:
         stop_local_server()
 
 
@@ -741,20 +765,33 @@ def start_connection(server_ip, player_name, room_code):
         sock.settimeout(5)
         sock.connect((SERVER_IP, PORT))
         send_json(sock, {"type": "hello", "name": NAME, "code": ROOM_CODE})
-        sock.settimeout(1.2)
+        sock.settimeout(3.0)
         lb = LineBuffer()
+        initial_state = None
         try:
-            data = sock.recv(65536)
-            for msg in lb.feed(data):
-                if msg.get("type") in ("reject", "full"):
-                    sock.close()
-                    sock = None
-                    return msg.get("msg", "Entrada recusada")
-                if msg.get("type") == "state":
-                    with state_lock:
-                        state = msg
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                data = sock.recv(65536)
+                if not data:
+                    break
+                for msg in lb.feed(data):
+                    if msg.get("type") in ("reject", "full"):
+                        sock.close()
+                        sock = None
+                        return msg.get("msg", "Entrada recusada")
+                    if msg.get("type") == "state":
+                        initial_state = msg
+                        break
+                if initial_state:
+                    break
         except socket.timeout:
             pass
+        if not initial_state:
+            sock.close()
+            sock = None
+            return f"Nao foi possivel entrar na sala {ROOM_CODE or '(sem codigo)'}. O servidor nao respondeu com o estado inicial."
+        with state_lock:
+            state = initial_state
         sock.settimeout(None)
         connected = True
         threading.Thread(target=net_reader, daemon=True).start()
@@ -1260,6 +1297,85 @@ def send_neutral_input():
         pass
 
 
+def send_start_game():
+    try:
+        send_json(sock, {"type": "start_game"})
+        play_sound("card")
+    except Exception:
+        pass
+
+
+def draw_lobby(st):
+    screen.fill((13, 18, 27))
+    for x in range(-100, WIDTH + 100, 92):
+        pygame.draw.line(screen, (24, 33, 47), (x, 0), (x + 260, HEIGHT), 2)
+    pygame.draw.rect(screen, (33, 46, 63), (0, HEIGHT - 150, WIDTH, 150))
+    pygame.draw.rect(screen, (86, 74, 54), (0, HEIGHT - 78, WIDTH, 78))
+    pygame.draw.circle(screen, (226, 146, 46), (180, HEIGHT - 120), 54)
+    pygame.draw.circle(screen, (67, 163, 124), (1110, 110), 70)
+    pygame.draw.circle(screen, (43, 68, 96), (1020, 188), 32)
+
+    panel = pygame.Rect(WIDTH // 2 - 420, 120, 840, 520)
+    pygame.draw.rect(screen, (24, 31, 43), panel, border_radius=14)
+    pygame.draw.rect(screen, (240, 178, 76), panel, 2, border_radius=14)
+
+    my_id = st.get("your_id")
+    host_id = st.get("host_id")
+    is_host = my_id == host_id
+    can_start = st.get("can_start", False)
+    room_code = st.get("room_code", ROOM_CODE)
+    required_players = max(1, int(st.get("required_players", 2)))
+
+    draw_text("Lobby da sala", panel.centerx, panel.y + 42, big, (255, 226, 158), center=True)
+    draw_text(f"Codigo: {room_code}", panel.centerx, panel.y + 82, font, (205, 215, 229), center=True)
+    players = sorted(st.get("players", []), key=lambda p: p["id"])
+    needed = max(0, required_players - len(players))
+    if can_start:
+        subtitle = "Todos conectados. O host decide quando iniciar."
+    elif needed > 0:
+        subtitle = f"Aguardando mais {needed} jogador(es) para liberar o inicio."
+    else:
+        subtitle = "Aguardando jogadores para liberar o inicio."
+    draw_text(subtitle, panel.centerx, panel.y + 116, small, (178, 190, 207), center=True)
+
+    list_panel = pygame.Rect(panel.x + 42, panel.y + 150, panel.width - 84, 250)
+    pygame.draw.rect(screen, (18, 24, 34), list_panel, border_radius=12)
+    pygame.draw.rect(screen, (84, 98, 118), list_panel, 2, border_radius=12)
+    draw_text("Jogadores conectados", list_panel.x + 22, list_panel.y + 18, font, (240, 244, 250))
+
+    for index, player in enumerate(players):
+        row = pygame.Rect(list_panel.x + 18, list_panel.y + 56 + index * 46, list_panel.width - 36, 36)
+        pygame.draw.rect(screen, (31, 38, 51), row, border_radius=8)
+        marker = "HOST" if player["id"] == host_id else f"P{player['id'] + 1}"
+        color = tuple(player.get("color", (230, 230, 230)))
+        draw_text(marker, row.x + 12, row.y + 8, small, (255, 226, 158) if player["id"] == host_id else (170, 184, 202))
+        draw_text(player["name"], row.x + 84, row.y + 7, font, color)
+        draw_text(f"{player['wins']}v", row.right - 54, row.y + 8, small, (205, 215, 229), center=True)
+
+    status_panel = pygame.Rect(panel.x + 42, panel.y + 424, panel.width - 84, 72)
+    pygame.draw.rect(screen, (18, 24, 34), status_panel, border_radius=12)
+    pygame.draw.rect(screen, (84, 98, 118), status_panel, 2, border_radius=12)
+    if is_host:
+        status_text = "Voce e o host desta sala."
+    elif host_id is not None:
+        host_name = next((p["name"] for p in players if p["id"] == host_id), "Host")
+        status_text = f"Aguardando {host_name} iniciar a partida."
+    else:
+        status_text = "Aguardando definicao do host."
+    draw_text(status_text, status_panel.x + 22, status_panel.y + 14, font, (240, 244, 250))
+    draw_text("Quando a partida iniciar, todos entram juntos na arena.", status_panel.x + 22, status_panel.y + 40, small, (178, 190, 207))
+
+    start_rect = pygame.Rect(panel.centerx - 170, panel.y + 448, 340, 56)
+    leave_rect = pygame.Rect(panel.centerx - 170, panel.y + 520, 340, 48)
+    hovered = pygame.mouse.get_pos()
+    if is_host:
+        draw_button(start_rect, "Iniciar partida", start_rect.collidepoint(hovered), primary=can_start)
+    else:
+        draw_button(start_rect, "Somente o host inicia", start_rect.collidepoint(hovered))
+    draw_button(leave_rect, "Voltar ao menu", leave_rect.collidepoint(hovered))
+    return {"start": start_rect, "leave": leave_rect, "is_host": is_host, "can_start": can_start}
+
+
 def draw_pause_menu():
     overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
     overlay.fill((4, 7, 12, 185))
@@ -1532,10 +1648,23 @@ def run_game():
             st = state.copy() if isinstance(state, dict) else None
 
         pause_rects = None
+        lobby_rects = None
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 close_connection(stop_host=True)
                 return "quit"
+            if st and st.get("phase") == "lobby":
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    close_connection(stop_host=True)
+                    return "menu"
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    lobby_rects = draw_lobby(st)
+                    if lobby_rects["leave"].collidepoint(event.pos):
+                        close_connection(stop_host=True)
+                        return "menu"
+                    if lobby_rects["is_host"] and lobby_rects["can_start"] and lobby_rects["start"].collidepoint(event.pos):
+                        send_start_game()
+                continue
             if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                 paused = not paused
                 sent_pause_stop = False
@@ -1582,7 +1711,10 @@ def run_game():
 
         if st:
             update_audio(st)
-            if paused:
+            if st.get("phase") == "lobby":
+                send_neutral_input()
+                draw_lobby(st)
+            elif paused:
                 if not sent_pause_stop:
                     send_neutral_input()
                     sent_pause_stop = True

@@ -452,11 +452,11 @@ class GameServer:
         self.players = {}
         self.next_pid = 0
         self.bullets = []
-        self.phase = "waiting"
+        self.phase = "lobby"
         self.phase_until = 0
         self.round_winner = None
         self.round = 1
-        self.log = ["Servidor iniciado. Aguardando jogadores..."]
+        self.log = ["Servidor iniciado. Lobby aberto."]
         self.running = True
         self.room_code = room_code.strip().upper()
         self.allow_solo = allow_solo
@@ -464,12 +464,34 @@ class GameServer:
         self.mutators_enabled = mutators_enabled
         self.more_cards_enabled = more_cards_enabled
         self.min_players = 1 if allow_solo else 2
+        self.host_id = None
         self.current_arena = ARENAS[0]
         self.round_started_at = time.time()
         self.hazard_hits = {}
         self.active_mutators = []
         self.effects = []
         self.offer_nonce = 0
+
+    def required_players_to_start(self):
+        return 1 if self.allow_solo else 2
+
+    def can_start_game(self):
+        return len(self.players) >= self.required_players_to_start()
+
+    def ensure_host(self):
+        if self.host_id in self.players:
+            return
+        self.host_id = min(self.players) if self.players else None
+
+    def reset_to_lobby(self, msg=None):
+        self.phase = "lobby"
+        self.phase_until = 0
+        self.round_winner = None
+        self.bullets.clear()
+        self.effects.clear()
+        self.hazard_hits.clear()
+        if msg:
+            self.log_msg(msg)
 
     def draft_deck_count(self):
         return 3 if self.more_cards_enabled else 1
@@ -724,9 +746,9 @@ class GameServer:
                 player = Player(pid, name or f"Player {pid + 1}")
                 self.players[pid] = player
                 self.clients[pid] = conn
+                if self.host_id is None:
+                    self.host_id = pid
                 self.log_msg(f"{player.name} conectado de {addr[0]}")
-                if len(self.players) >= self.min_players and self.phase == "waiting":
-                    self.start_round()
             threading.Thread(target=self.client_reader, args=(pid, conn), daemon=True).start()
 
     def read_hello(self, conn):
@@ -762,11 +784,9 @@ class GameServer:
                     name = self.players[pid].name
                     self.players.pop(pid, None)
                     self.log_msg(f"{name} desconectou")
-                if len(self.players) < self.min_players and self.phase != "waiting":
-                    self.phase = "waiting"
-                    self.bullets.clear()
-                    self.round_winner = None
-                    self.log_msg("Aguardando jogadores para continuar")
+                self.ensure_host()
+                if len(self.players) < self.required_players_to_start() and self.phase in ("playing", "cards"):
+                    self.reset_to_lobby("Jogadores insuficientes. Voltando ao lobby.")
             try:
                 conn.close()
             except Exception:
@@ -816,6 +836,16 @@ class GameServer:
                     p.frozen_cards.append(card)
                     p.draft_points -= 1
                     self.log_msg(f"{p.name} congelou {CARD_DEFS[card]['name']}")
+            elif msg.get("type") == "start_game":
+                if pid != self.host_id:
+                    return
+                if self.phase != "lobby":
+                    return
+                if not self.can_start_game():
+                    self.log_msg("Nao ha jogadores suficientes para iniciar")
+                    return
+                self.log_msg(f"{p.name} iniciou a partida")
+                self.start_round()
 
     def start_round(self):
         self.phase = "playing"
@@ -2018,6 +2048,10 @@ class GameServer:
         return {
             "type": "state",
             "your_id": pid,
+            "host_id": self.host_id,
+            "can_start": self.can_start_game(),
+            "required_players": self.required_players_to_start(),
+            "room_code": self.room_code,
             "phase": self.phase,
             "round": self.round,
             "phase_until": self.phase_until,
